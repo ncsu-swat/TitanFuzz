@@ -1,189 +1,156 @@
+# model.py
 import re
 import time
+import os
+import ollama
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, T5ForConditionalGeneration
 
-
-class SpanLM(object):
-    def __init__(self, pretrained: str = "", weight=None, batch_size=1):
-        print("Initializing a SpanLM based model: {} ...".format(pretrained))
+class LanguageModel:
+    """
+    A unified interface for generating code from a language model, supporting
+    both local Ollama models and legacy Hugging Face models.
+    """
+    def __init__(self, model_identifier: str, num_samples: int = 1):
+        print(f"Initializing Language Model: {model_identifier} ...")
         t_start = time.time()
-        self.pretrained = pretrained
+        self.model_identifier = model_identifier
+        self.num_samples = num_samples # Default samples per call
+        
+        # This is the generic placeholder for modern instruction-tuned models.
+        self.infill_ph = "<FILL_ME>"
+
+        if model_identifier.startswith("ollama/"):
+            self.backend = "ollama"
+            self._init_ollama(model_identifier)
+        else:
+            self.backend = "hf"
+            self._init_huggingface(model_identifier)
+        
+        print(f"Model '{model_identifier}' on backend '{self.backend}' initialized in {time.time() - t_start:.2f}s")
+
+    def _init_ollama(self, model_identifier: str):
+        """Initializes the Ollama backend."""
+        if ollama is None:
+            raise ImportError("The 'ollama' package is not installed. Please install it with `pip install ollama`.")
+        
+        self.ollama_model_name = model_identifier.split("/", 1)[1]
+        try:
+            # Check if the Ollama server is running and the model exists.
+            self.client = ollama.Client()
+            self.client.show(self.ollama_model_name)
+            print(f"Successfully connected to Ollama and verified model '{self.ollama_model_name}'.")
+        except Exception as e:
+            print(f"Error: Could not connect to Ollama or find model '{self.ollama_model_name}'.")
+            print(f"Please ensure the Ollama server is running and you have pulled the model (e.g., `ollama pull {self.ollama_model_name}`).")
+            raise e
+
+    def _init_huggingface(self, model_identifier: str):
+        """Initializes the legacy Hugging Face backend."""
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        print("Warning: Using legacy Hugging Face backend. This path is for older span-infilling models like InCoder.")
+        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.extra_end = None  # some models requires some ending tokens
-        if "Salesforce" in pretrained:
-            self.model = T5ForConditionalGeneration.from_pretrained(pretrained)
-            self.max_length = self.model.config.to_dict()["n_positions"]
-            self.infill_ph = "<extra_id_0>"
-        elif "facebook" in pretrained:
-            if weight == "float16":
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    pretrained, revision="float16", torch_dtype=torch.float16
-                )
-                self.model = self.model.half()
-            else:
-                self.model = AutoModelForCausalLM.from_pretrained(pretrained)
-            self.max_length = self.model.config.to_dict()["max_position_embeddings"]
-            self.infill_ph = "<|mask:{}|>"
-            self.infill_pattern = re.compile(r"<\|mask:\d\|>")
-            self.extra_end = "<|mask:1|><|mask:0|>"
-            # signals the end of a generated infill
-            self.EOM = "<|endofmask|>"
-            self.BOS = "<|endoftext|>"
-            self.META_FILE = "<|/ file"
-
-        else:
-            raise NotImplementedError
-        print("Max length: {}".format(self.max_length))
-        self.model = self.model.to(self.device)
-        self.tokenizer = AutoTokenizer.from_pretrained(pretrained)
-        self.tokenizer.pad_token = 0
+        self.model = AutoModelForCausalLM.from_pretrained(model_identifier).to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_identifier)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
-        self.batch_size = batch_size
-        print("Batch size: {}".format(batch_size))
-        # Takes ~15 seconds to load the incoder-1B model.
-        # TODO: solve the memory leak issue and avoid reloading the model
-        print("Model loading time: {}".format(time.time() - t_start))
 
-    def build_input(self, infill_code: str):
-        if self.extra_end:
-            return infill_code + self.extra_end
-        return infill_code
+        # Legacy placeholders for InCoder
+        self.infill_ph = "<|mask:0|>"
+        self.extra_end = "<|mask:1|><|mask:0|>"
+        self.EOM = "<|endofmask|>"
 
-    def build_input_multi(self, infill_code: str, index: int, extra_end: int = 0):
-        if extra_end != 0:
-            return infill_code + "<|mask:{}|><|mask:{}|>".format(extra_end, index)
-        else:
-            return infill_code + "<|mask:{}|>".format(index)
+    def generate(self, infill_code: str, num_samples: int, do_sample: bool = True) -> list[str]:
+        """
+        Generates code completions for the given input.
+        
+        Args:
+            infill_code: The code with a placeholder (e.g., <FILL_ME>).
+            num_samples: The number of code samples to generate.
+            do_sample: Whether to use sampling (recommended for diversity).
 
-    def model_predict(self, infill_code: str, do_sample=False, num_samples=1000):
-        input_tokens = self.tokenizer.encode(
-            self.build_input(infill_code), return_tensors="pt"
-        ).repeat(min(num_samples, self.batch_size), 1)
-        input_tokens = input_tokens.to(self.device)
+        Returns:
+            A list of completed code strings.
+        """
+        if self.infill_ph not in infill_code:
+            print(f"Warning: Placeholder '{self.infill_ph}' not found in the input code. Returning no generations.")
+            return []
+
+        if self.backend == "ollama":
+            return self._generate_ollama(infill_code, num_samples, do_sample)
+        else: # self.backend == "hf"
+            return self._generate_huggingface(infill_code, num_samples, do_sample)
+
+    def _generate_ollama(self, infill_code: str, num_samples: int, do_sample: bool) -> list[str]:
+        """Generates code using the Ollama backend."""
+        prefix, suffix = infill_code.split(self.infill_ph, 1)
+
+        # A clear, robust prompt for modern instruction-tuned models
+        prompt_template = f"""You are an expert Python programmer. Your task is to complete the following Python code snippet. The missing part is indicated by `{self.infill_ph}`.
+        You must provide ONLY the raw Python code that replaces `{self.infill_ph}`. Do not add any explanations, comments, or markdown formatting like ```python ... ```.
+
+        Code snippet:
+        ```python
+        {infill_code}
+        ```
+        Provide the code to fill in {self.infill_ph}:
+        """
+        outputs = []
+        for _ in range(num_samples):
+            try:
+                # Temperature and top_p are common sampling parameters
+                options = {"temperature": 1.0, "top_p": 0.95} if do_sample else {}
+                response = self.client.generate(
+                    model=self.ollama_model_name,
+                    prompt=prompt_template,
+                    stream=False,
+                    options=options,
+                )
+                completion = response['response']
+                
+                # Clean the output: remove markdown and surrounding whitespace
+                completion = re.sub(r'```(?:python\n)?(.*?)\n?```', r'\1', completion, flags=re.DOTALL).strip()
+                
+                outputs.append(prefix + completion + suffix)
+            except Exception as e:
+                print(f"Error during Ollama generation: {e}")
+                continue
+        return outputs
+
+    def _generate_huggingface(self, infill_code: str, num_samples: int, do_sample: bool) -> list[str]:
+        """Generates code using the legacy Hugging Face backend."""
+        import torch
+        
+        prompt = infill_code + self.extra_end
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        
+        max_length = inputs.input_ids.shape[1] + 64 # Generate up to 64 new tokens
+        
         with torch.no_grad():
-            raw_o = self.model.generate(
-                input_tokens,
-                max_length=len(input_tokens[0]) + 50,
+            raw_outputs = self.model.generate(
+                **inputs,
                 do_sample=do_sample,
                 top_p=0.95,
-                temperature=1,
+                temperature=1.0,
+                num_return_sequences=num_samples,
+                max_length=max_length,
+                pad_token_id=self.tokenizer.pad_token_id,
             )
-            if "Salesforce" in self.pretrained:
-                outputs = self.tokenizer.batch_decode(raw_o, skip_special_tokens=True)
-            elif "facebook" in self.pretrained:
-                outputs = self.tokenizer.batch_decode(
-                    raw_o, clean_up_tokenization_spaces=False
-                )
-                t_outputs = []
-                for output in outputs:
-                    if output.startswith(self.BOS):
-                        output = output[len(self.BOS) :]
-                    output = output[
-                        output.index(self.extra_end) + len(self.extra_end) :
-                    ]
-                    if self.EOM not in output:
-                        continue
-                    output = output[: output.index(self.EOM)]
-                    if (
-                        self.META_FILE in output
-                    ):  # removes META file token that is sometimes generated
-                        output = output[: output.index(self.META_FILE)]
-                    t_outputs.append(output)
-                outputs = t_outputs
-        outputs = [infill_code.replace(self.infill_ph, output) for output in outputs]
-        return len(outputs) > 0, True, outputs
+        
+        decoded_outputs = self.tokenizer.batch_decode(raw_outputs, skip_special_tokens=False)
+        
+        completions = []
+        for output in decoded_outputs:
+            # Extract the generated text between the prompt and the end-of-mask token
+            start_index = len(prompt)
+            try:
+                end_index = output.index(self.EOM, start_index)
+                completion = output[start_index:end_index]
+                completions.append(infill_code.replace(self.infill_ph, completion))
+            except ValueError:
+                continue # EOM token not found, generation was likely incomplete
+        
+        return completions
 
-    def model_predict_multi(self, infill_code: str, do_sample=False, num_samples=1000):
-        # first find how many tokens have been filled
-        parts = re.split(self.infill_pattern, infill_code)
-        outputs, tmp_prompt = [], []
-
-        for index, part in enumerate(parts[:-1]):
-            if index == 0:
-                n_infill_code = self.build_input_multi(
-                    infill_code, index, len(parts) - 1
-                )
-                input_tokens = self.tokenizer.encode(
-                    n_infill_code, return_tensors="pt"
-                ).repeat(min(num_samples, self.batch_size), 1)
-                input_tokens = input_tokens.to(self.device)
-                with torch.no_grad():
-                    raw_o = self.model.generate(
-                        input_tokens,
-                        max_length=len(input_tokens[0]) + 50,
-                        do_sample=do_sample,
-                        top_p=0.95,
-                        temperature=1,
-                    )
-                    o = self.tokenizer.batch_decode(
-                        raw_o, clean_up_tokenization_spaces=False
-                    )
-                    for output in o:
-
-                        if output.startswith(self.BOS):
-                            output = output[len(self.BOS) :]
-                        output = output[
-                            output.index(
-                                "<|mask:{}|>".format(index),
-                                output.index("<|mask:{}|>".format(index)) + 1,
-                            )
-                            + len("<|mask:{}|>".format(index)) :
-                        ]
-                        if self.EOM not in output:
-                            continue
-                        output = output[: output.index(self.EOM)]
-                        if (
-                            self.META_FILE in output
-                        ):  # removes META file token that is sometimes generated
-                            output = output[: output.index(self.META_FILE)]
-                        outputs.append(part + output)
-                        tmp_prompt.append(n_infill_code + output + self.EOM)
-                    # print(outputs)
-            else:
-                tmp_prompt = [self.build_input_multi(x, index) for x in tmp_prompt]
-                if len(tmp_prompt) == 0:
-                    return False, True, []
-                input_tokens = self.tokenizer(
-                    tmp_prompt, return_tensors="pt", padding="longest"
-                ).input_ids  # guaranteed to be within batch limit
-                input_tokens = input_tokens.to(self.device)
-                with torch.no_grad():
-                    raw_o = self.model.generate(
-                        input_tokens,
-                        max_length=len(input_tokens[0]) + 50,
-                        do_sample=do_sample,
-                        top_p=0.95,
-                        temperature=1,
-                    )
-                    o = self.tokenizer.batch_decode(
-                        raw_o, clean_up_tokenization_spaces=False
-                    )
-                    t_outputs = []
-                    t_prompt = []
-                    for i, output in enumerate(o):
-                        if output.startswith(self.BOS):
-                            output = output[len(self.BOS) :]
-                        output = output[
-                            output.index(
-                                "<|mask:{}|>".format(index),
-                                output.index("<|mask:{}|>".format(index)) + 1,
-                            )
-                            + len("<|mask:{}|>".format(index)) :
-                        ]
-                        if self.EOM not in output:
-                            continue
-                        output = output[: output.index(self.EOM)]
-                        if (
-                            self.META_FILE in output
-                        ):  # removes META file token that is sometimes generated
-                            output = output[: output.index(self.META_FILE)]
-                        # print(output)
-                        t_outputs.append(outputs[i] + part + output)
-                        t_prompt.append(tmp_prompt[i] + output + self.EOM)
-                    outputs = t_outputs
-                    tmp_prompt = t_prompt
-
-        outputs = [x + parts[-1] for x in outputs]
-        return len(outputs) > 0, True, outputs
